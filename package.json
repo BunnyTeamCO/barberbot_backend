@@ -1,0 +1,20 @@
+{
+  "name": "barberbot-backend",
+  "version": "1.0.0",
+  "description": "Backend Core para BarberBot Enterprise",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "pg": "^8.11.3",
+    "dotenv": "^16.3.1",
+    "axios": "^1.6.2",
+    "body-parser": "^1.20.2",
+    "@google/genai": "^0.1.0"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
