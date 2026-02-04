@@ -8,22 +8,31 @@ const { google } = require('googleapis');
 const app = express();
 app.use(bodyParser.json());
 
-// --- CONFIGURACIÓN ---
+// --- 1. CONFIGURACIÓN ROBUSTA DE LLAVES ---
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// Limpieza robusta de la llave privada
-const privateKey = process.env.GOOGLE_PRIVATE_KEY 
-  ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') 
-  : '';
+// FUNCIÓN MÁGICA: Limpia la llave privada sin importar cómo se pegó
+const getCleanPrivateKey = () => {
+  const key = process.env.GOOGLE_PRIVATE_KEY;
+  if (!key) return '';
+  
+  // Si ya tiene saltos de línea reales, devolverla tal cual
+  if (key.includes('-----BEGIN PRIVATE KEY-----') && key.includes('\n')) {
+    return key;
+  }
+  
+  // Si está todo en una línea con "\n" literal, convertirlo
+  return key.replace(/\\n/g, '\n');
+};
 
 const jwtClient = new google.auth.JWT(
   process.env.GOOGLE_CLIENT_EMAIL,
   null,
-  privateKey,
+  getCleanPrivateKey(),
   ['https://www.googleapis.com/auth/calendar']
 );
 
-// --- RUTAS ---
+// --- 2. RUTAS ---
 app.get('/webhook', (req, res) => {
   if (req.query['hub.verify_token'] === process.env.META_VERIFY_TOKEN) {
     res.status(200).send(req.query['hub.challenge']);
@@ -45,28 +54,25 @@ app.post('/webhook', async (req, res) => {
     console.log(`📩 Mensaje de ${from}: ${text}`);
 
     try {
-      // 1. PENSAR (IA)
+      // PENSAR
       const aiAnalysis = await analyzeWithGemini(text);
       console.log("🧠 Análisis IA:", JSON.stringify(aiAnalysis));
 
       let finalResponse = "";
 
       if (aiAnalysis.intent === 'booking' && aiAnalysis.date) {
-        // 2. VERIFICAR CALENDARIO
+        // VERIFICAR CALENDARIO
         const availability = await checkRealAvailability(aiAnalysis.date);
         
         if (availability.status === 'error') {
-            // ERROR TÉCNICO: Avisar al usuario para arreglarlo
-            finalResponse = `🔧 **Error de Sistema:** \n${availability.message}\n\n(Revisa tus variables en Coolify)`;
+            finalResponse = `🔧 **Error Técnico:** \n${availability.message}`;
         } else if (availability.status === 'busy') {
-            // OCUPADO REAL
-            finalResponse = `😅 Uff, revisé mi agenda y justo a esa hora (${aiAnalysis.humanDate}) ya estoy ocupado. ¿Te sirve probar una hora más tarde?`;
+            finalResponse = `😅 Uff, justo a esa hora (${aiAnalysis.humanDate}) ya estoy ocupado. ¿Te sirve una hora más tarde?`;
         } else {
-            // LIBRE
-            finalResponse = `✅ ¡Listo! Tengo espacio libre para el ${aiAnalysis.humanDate}. ¿Te lo aparto de una vez?`;
+            finalResponse = `✅ ¡Sí! Tengo espacio libre para el ${aiAnalysis.humanDate}. ¿Te lo aparto de una vez?`;
         }
       } else {
-        // CHARLA CASUAL
+        // CHARLA
         finalResponse = aiAnalysis.reply;
       }
 
@@ -78,7 +84,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// --- FUNCIONES ---
+// --- 3. FUNCIONES ---
 
 async function analyzeWithGemini(userText) {
   try {
@@ -86,20 +92,20 @@ async function analyzeWithGemini(userText) {
     const nowCol = new Date().toLocaleString("es-CO", { timeZone: "America/Bogota" });
     
     const prompt = `
-      Eres BarberBot, un asistente amable y relajado de una barbería en Colombia.
+      Eres BarberBot, asistente de una barbería en Colombia.
       Fecha actual: ${nowCol}.
       Usuario dice: "${userText}"
       
-      REGLAS DE ORO:
-      1. Si el usuario dice "Hola", "Buenos días", "Precios", o NO menciona una fecha/hora específica -> Intent es "chat". NO inventes fechas.
-      2. Solo si dice explícitamente "quiero cita mañana", "el viernes a las 3", etc -> Intent es "booking".
+      REGLAS:
+      1. Si el usuario pide cita (ej: "mañana a las 10am"), extrae la fecha ISO (YYYY-MM-DDTHH:mm:ss-05:00).
+      2. Si solo saluda, responde amable y corto. NO inventes fechas.
       
       Responde SOLO JSON:
       {
         "intent": "booking" | "chat",
-        "date": "YYYY-MM-DDTHH:mm:ss-05:00" (Solo si es booking, sino null),
-        "humanDate": "Ej: Viernes 3pm" (o null),
-        "reply": "Tu respuesta amable aquí" (Solo si es chat)
+        "date": "ISO_STRING" (o null),
+        "humanDate": "Ej: Viernes 10am" (o null),
+        "reply": "Respuesta" (o null)
       }
     `;
 
@@ -119,11 +125,8 @@ async function checkRealAvailability(isoDateStart) {
         const start = new Date(isoDateStart);
         const end = new Date(start.getTime() + 60 * 60 * 1000); // 1 hora
 
-        const calendarId = process.env.GOOGLE_CALENDAR_ID;
-        if (!calendarId) throw new Error("Falta la variable GOOGLE_CALENDAR_ID");
-
         const res = await calendar.events.list({
-            calendarId: calendarId,
+            calendarId: process.env.GOOGLE_CALENDAR_ID,
             timeMin: start.toISOString(),
             timeMax: end.toISOString(),
             singleEvents: true
@@ -140,18 +143,12 @@ async function checkRealAvailability(isoDateStart) {
     } catch (error) {
         console.error("❌ Error Calendario:", error.message);
         
-        // Diagnóstico de errores comunes para enviar al chat
-        let userMsg = "No pude conectar con el calendario.";
+        // Diagnóstico preciso para el usuario
+        let msg = "No pude conectar al calendario.";
+        if (error.message.includes("PEM routines")) msg = "❌ Error: La llave privada (PRIVATE KEY) sigue teniendo formato incorrecto.";
+        if (error.message.includes("Not Found")) msg = `❌ Error: No encuentro el calendario o el email del robot (${process.env.GOOGLE_CLIENT_EMAIL}) no tiene permiso.`;
         
-        if (error.message.includes("Not Found")) {
-            userMsg = `❌ Error: No encuentro el calendario "${process.env.GOOGLE_CALENDAR_ID}". \n👉 Asegúrate de haberlo COMPARTIDO con el email del robot: ${process.env.GOOGLE_CLIENT_EMAIL}`;
-        } else if (error.message.includes("Invalid grant") || error.message.includes("signing")) {
-            userMsg = "❌ Error: La LLAVE PRIVADA (Private Key) está mal copiada en Coolify.";
-        } else if (error.message.includes("Service accounts cannot invite")) {
-             userMsg = "❌ Error: Permisos insuficientes. Dale permiso de 'Hacer cambios' al robot.";
-        }
-
-        return { status: 'error', message: userMsg };
+        return { status: 'error', message: msg };
     }
 }
 
@@ -177,5 +174,5 @@ async function sendToWhatsApp(to, textBody) {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 BarberBot V3 (Diagnóstico) puerto ${PORT}`);
+  console.log(`🚀 BarberBot Final (Key Fix) puerto ${PORT}`);
 });
