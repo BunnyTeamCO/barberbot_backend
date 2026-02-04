@@ -1,7 +1,7 @@
 {
   "name": "barberbot-backend",
-  "version": "1.1.0",
-  "description": "Backend Inteligente",
+  "version": "1.2.0",
+  "description": "Backend BarberBot Production",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
