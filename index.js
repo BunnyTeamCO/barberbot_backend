@@ -8,20 +8,13 @@ const { google } = require('googleapis');
 const app = express();
 app.use(bodyParser.json());
 
-// --- 1. CONFIGURACIÓN ROBUSTA DE LLAVES ---
+// --- CONFIGURACIÓN ---
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// FUNCIÓN MÁGICA: Limpia la llave privada sin importar cómo se pegó
 const getCleanPrivateKey = () => {
   const key = process.env.GOOGLE_PRIVATE_KEY;
   if (!key) return '';
-  
-  // Si ya tiene saltos de línea reales, devolverla tal cual
-  if (key.includes('-----BEGIN PRIVATE KEY-----') && key.includes('\n')) {
-    return key;
-  }
-  
-  // Si está todo en una línea con "\n" literal, convertirlo
+  if (key.includes('-----BEGIN PRIVATE KEY-----') && key.includes('\n')) return key;
   return key.replace(/\\n/g, '\n');
 };
 
@@ -32,7 +25,7 @@ const jwtClient = new google.auth.JWT(
   ['https://www.googleapis.com/auth/calendar']
 );
 
-// --- 2. RUTAS ---
+// --- RUTAS ---
 app.get('/webhook', (req, res) => {
   if (req.query['hub.verify_token'] === process.env.META_VERIFY_TOKEN) {
     res.status(200).send(req.query['hub.challenge']);
@@ -43,7 +36,6 @@ app.get('/webhook', (req, res) => {
 
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
-
   const body = req.body;
 
   if (body.object && body.entry?.[0]?.changes?.[0]?.value?.messages?.[0]) {
@@ -54,66 +46,55 @@ app.post('/webhook', async (req, res) => {
     console.log(`📩 Mensaje de ${from}: ${text}`);
 
     try {
-      // PENSAR
+      // 1. PENSAR
       const aiAnalysis = await analyzeWithGemini(text);
-      console.log("🧠 Análisis IA:", JSON.stringify(aiAnalysis));
+      console.log("🧠 IA:", JSON.stringify(aiAnalysis));
 
       let finalResponse = "";
 
       if (aiAnalysis.intent === 'booking' && aiAnalysis.date) {
-        // VERIFICAR CALENDARIO
+        // 2. VERIFICAR
         const availability = await checkRealAvailability(aiAnalysis.date);
         
         if (availability.status === 'error') {
-            finalResponse = `🔧 **Error Técnico:** \n${availability.message}`;
+            // AQUÍ ESTÁ EL CAMBIO: Te enviará el error técnico exacto
+            finalResponse = `💀 ERROR TÉCNICO EXACTO:\n${availability.rawError}`;
         } else if (availability.status === 'busy') {
-            finalResponse = `😅 Uff, justo a esa hora (${aiAnalysis.humanDate}) ya estoy ocupado. ¿Te sirve una hora más tarde?`;
+            finalResponse = `⚠️ Ocupado a esa hora (${aiAnalysis.humanDate}). Intenta otra.`;
         } else {
-            finalResponse = `✅ ¡Sí! Tengo espacio libre para el ${aiAnalysis.humanDate}. ¿Te lo aparto de una vez?`;
+            finalResponse = `✅ ¡Libre! ${aiAnalysis.humanDate}. ¿Agendamos?`;
         }
       } else {
-        // CHARLA
         finalResponse = aiAnalysis.reply;
       }
 
       await sendToWhatsApp(from, finalResponse);
 
     } catch (error) {
-      console.error("❌ Error Crítico:", error);
+      console.error("❌ Error General:", error);
+      await sendToWhatsApp(from, `Error Crítico del Servidor: ${error.message}`);
     }
   }
 });
 
-// --- 3. FUNCIONES ---
-
+// --- FUNCIONES ---
 async function analyzeWithGemini(userText) {
   try {
     const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" }); 
     const nowCol = new Date().toLocaleString("es-CO", { timeZone: "America/Bogota" });
     
     const prompt = `
-      Eres BarberBot, asistente de una barbería en Colombia.
-      Fecha actual: ${nowCol}.
-      Usuario dice: "${userText}"
-      
-      REGLAS:
-      1. Si el usuario pide cita (ej: "mañana a las 10am"), extrae la fecha ISO (YYYY-MM-DDTHH:mm:ss-05:00).
-      2. Si solo saluda, responde amable y corto. NO inventes fechas.
-      
-      Responde SOLO JSON:
-      {
-        "intent": "booking" | "chat",
-        "date": "ISO_STRING" (o null),
-        "humanDate": "Ej: Viernes 10am" (o null),
-        "reply": "Respuesta" (o null)
-      }
+      Eres BarberBot. Fecha en Colombia: ${nowCol}.
+      Usuario: "${userText}"
+      REGLA: Si pide cita, extrae fecha ISO (YYYY-MM-DDTHH:mm:ss-05:00).
+      Responde JSON: { "intent": "booking"|"chat", "date": "ISO"|null, "humanDate": "Texto"|null, "reply": "Texto"|null }
     `;
 
     const result = await model.generateContent(prompt);
     const text = result.response.text().replace(/```json|```/g, '').trim();
     return JSON.parse(text);
   } catch (e) {
-    return { intent: "chat", reply: "Hola, ¿en qué te puedo ayudar hoy?" };
+    return { intent: "chat", reply: "Hola, ¿en qué te ayudo?" };
   }
 }
 
@@ -121,9 +102,8 @@ async function checkRealAvailability(isoDateStart) {
     try {
         await jwtClient.authorize();
         const calendar = google.calendar({ version: 'v3', auth: jwtClient });
-        
         const start = new Date(isoDateStart);
-        const end = new Date(start.getTime() + 60 * 60 * 1000); // 1 hora
+        const end = new Date(start.getTime() + 60 * 60 * 1000);
 
         const res = await calendar.events.list({
             calendarId: process.env.GOOGLE_CALENDAR_ID,
@@ -132,23 +112,13 @@ async function checkRealAvailability(isoDateStart) {
             singleEvents: true
         });
 
-        // Filtrar eventos cancelados
         const activeEvents = res.data.items.filter(e => e.status !== 'cancelled');
-
-        if (activeEvents.length > 0) {
-            return { status: 'busy' };
-        }
-        return { status: 'free' };
+        return activeEvents.length > 0 ? { status: 'busy' } : { status: 'free' };
 
     } catch (error) {
-        console.error("❌ Error Calendario:", error.message);
-        
-        // Diagnóstico preciso para el usuario
-        let msg = "No pude conectar al calendario.";
-        if (error.message.includes("PEM routines")) msg = "❌ Error: La llave privada (PRIVATE KEY) sigue teniendo formato incorrecto.";
-        if (error.message.includes("Not Found")) msg = `❌ Error: No encuentro el calendario o el email del robot (${process.env.GOOGLE_CLIENT_EMAIL}) no tiene permiso.`;
-        
-        return { status: 'error', message: msg };
+        console.error("❌ ERROR GOOGLE:", error);
+        // Devolvemos el mensaje crudo para que lo veas en WhatsApp
+        return { status: 'error', rawError: error.message }; 
     }
 }
 
@@ -157,22 +127,11 @@ async function sendToWhatsApp(to, textBody) {
         await axios({
             method: 'POST',
             url: `https://graph.facebook.com/v18.0/${process.env.META_PHONE_ID}/messages`,
-            headers: {
-                'Authorization': `Bearer ${process.env.META_TOKEN}`,
-                'Content-Type': 'application/json',
-            },
-            data: {
-                messaging_product: 'whatsapp',
-                to: to,
-                text: { body: textBody }
-            }
+            headers: { 'Authorization': `Bearer ${process.env.META_TOKEN}`, 'Content-Type': 'application/json' },
+            data: { messaging_product: 'whatsapp', to: to, text: { body: textBody } }
         });
-    } catch (error) {
-        console.error("Error envío WhatsApp", error.message);
-    }
+    } catch (error) { console.error("Error envío:", error.message); }
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 BarberBot Final (Key Fix) puerto ${PORT}`);
-});
+app.listen(PORT, () => { console.log(`🚀 BarberBot V4 Debug (${PORT})`); });
