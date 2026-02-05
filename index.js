@@ -33,7 +33,7 @@ const jwtClient = new google.auth.JWT(
   ['https://www.googleapis.com/auth/calendar']
 );
 
-// --- 2. RUTAS WEBHOOK ---
+// --- 2. RUTAS ---
 app.get('/webhook', (req, res) => {
   if (req.query['hub.verify_token'] === process.env.META_VERIFY_TOKEN) {
     res.status(200).send(req.query['hub.challenge']);
@@ -52,10 +52,9 @@ app.post('/webhook', async (req, res) => {
   const text = (message.text ? message.text.body : '').trim();
 
   try {
-    // RESET
     if (text.toLowerCase() === '/reset') {
-        await pool.query("DELETE FROM clients WHERE phone_number = $1", [from]); // El cascade borra el historial también
-        await sendToWhatsApp(from, "🔄 Memoria borrada. Escríbeme 'Hola'.");
+        await pool.query("DELETE FROM clients WHERE phone_number = $1", [from]);
+        await sendToWhatsApp(from, "🔄 Memoria borrada.");
         return;
     }
 
@@ -63,7 +62,7 @@ app.post('/webhook', async (req, res) => {
     let userRes = await pool.query('SELECT id, full_name, conversation_state FROM clients WHERE phone_number = $1', [from]);
     let user = userRes.rows[0];
 
-    // B. BIENVENIDA (Sin memoria aún)
+    // B. Bienvenida
     if (!user) {
         const newId = crypto.randomUUID();
         await pool.query("INSERT INTO clients (id, phone_number, conversation_state) VALUES ($1, $2, 'WAITING_NAME')", [newId, from]);
@@ -71,49 +70,85 @@ app.post('/webhook', async (req, res) => {
         return;
     }
 
-    // C. CAPTURAR NOMBRE
     if (user.conversation_state === 'WAITING_NAME') {
         const cleanName = text.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
         if (cleanName.length < 3) {
-            await sendToWhatsApp(from, "Porfa dame un nombre válido para registrarte. 😉");
+            await sendToWhatsApp(from, "Dame un nombre real, porfa. 😉");
             return;
         }
         await pool.query("UPDATE clients SET full_name = $1, conversation_state = 'ACTIVE' WHERE phone_number = $2", [cleanName, from]);
-        await sendToWhatsApp(from, `¡Listo, *${cleanName}*! Ya estás registrado.\n\n¿En qué te puedo ayudar hoy?`);
+        await sendToWhatsApp(from, `¡Listo, *${cleanName}*! Ya estás registrado.\n\n¿Quieres agendar, consultar o cancelar una cita?`);
         return;
     }
 
-    // D. CHAT CON MEMORIA 🧠
-    
-    // 1. Guardar mensaje del usuario en historial
+    // C. MEMORIA DE CHAT
     await saveChatMessage(user.id, 'user', text);
-
-    // 2. Recuperar últimos 6 mensajes para contexto
     const history = await getChatHistory(user.id);
 
-    // 3. Consultar a Gemini con contexto
+    // D. CEREBRO IA
     const clientName = user.full_name || "Amigo";
     const ai = await talkToGemini(text, clientName, history);
-    console.log(`🧠 IA (${clientName}): ${ai.intent}`);
+    console.log(`🧠 IA (${ai.intent}):`, ai.reply);
 
     let response = ai.reply;
 
-    // Lógica de Citas
+    // --- LÓGICA DE INTENCIONES ---
+
+    // 1. AGENDAR (Booking)
     if (ai.intent === 'booking' && ai.date) {
         const calendarStatus = await checkCalendar(ai.date);
         if (calendarStatus === 'busy') {
-            response = `Uff ${clientName}, a esa hora (${ai.humanDate}) ya estoy ocupado. 😅 ¿Te sirve otra?`;
+            response = `Uff ${clientName}, a esa hora ya estoy ocupado. 😅 ¿Te sirve otra?`;
         } else if (calendarStatus === 'free') {
             const booked = await saveBooking(ai.date, from, user.id, clientName);
             response = booked 
-              ? `✅ ¡Agendado, *${clientName}*! Nos vemos el *${ai.humanDate}*.`
-              : `Tuve un error guardando la cita. Intenta de nuevo.`;
-        } else {
-            response = `Tuve un problema técnico con la agenda. Intenta en un minuto.`;
+              ? `✅ ¡Agendado! Nos vemos el *${ai.humanDate}*.`
+              : `Tuve un error guardando la cita.`;
         }
     }
 
-    // 4. Enviar y Guardar respuesta del bot
+    // 2. CONSULTAR (Check)
+    else if (ai.intent === 'check') {
+        const appointments = await getUserAppointments(user.id);
+        if (appointments.length > 0) {
+            const lista = appointments.map(cita => {
+                const dateObj = new Date(cita.start_time);
+                return `🗓️ *${dateObj.toLocaleDateString('es-CO')}* a las *${dateObj.toLocaleTimeString('es-CO', {hour: '2-digit', minute:'2-digit'})}*`;
+            }).join("\n");
+            response = `Aquí están tus citas pendientes:\n\n${lista}`;
+        } else {
+            response = `No tienes citas futuras programadas. ¿Agendamos una?`;
+        }
+    }
+
+    // 3. CANCELAR (Cancel) - ¡NUEVO!
+    else if (ai.intent === 'cancel') {
+        const result = await cancelNextAppointment(user.id);
+        response = result.success 
+            ? `🗑️ Listo ${clientName}, he cancelado tu cita del *${result.date}*.`
+            : `No encontré ninguna cita pendiente para cancelar.`;
+    }
+
+    // 4. REAGENDAR (Reschedule) - ¡NUEVO!
+    else if (ai.intent === 'reschedule' && ai.date) {
+        // Verificar disponibilidad de la NUEVA fecha
+        const calendarStatus = await checkCalendar(ai.date);
+        if (calendarStatus === 'busy') {
+            response = `No puedo cambiarla a esa hora (${ai.humanDate}) porque ya estoy ocupado. Intenta otro horario.`;
+        } else {
+            // Intentar mover la cita
+            const result = await rescheduleNextAppointment(user.id, ai.date);
+            if (result.success) {
+                response = `🔄 ¡Hecho! Moví tu cita anterior para el *${ai.humanDate}*.`;
+            } else if (result.reason === 'no_appointment') {
+                response = `No encontré ninguna cita vieja para mover. ¿Quieres agendar una nueva?`;
+            } else {
+                response = `Tuve un error técnico moviendo la cita.`;
+            }
+        }
+    }
+
+    // Enviar y guardar respuesta
     await sendToWhatsApp(from, response);
     await saveChatMessage(user.id, 'assistant', response);
 
@@ -122,37 +157,105 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// --- 3. FUNCIONES DE MEMORIA (NUEVO) ---
+// --- 3. FUNCIONES DE GESTIÓN DE CITAS ---
+
+async function getUserAppointments(clientId) {
+    try {
+        const res = await pool.query(
+            `SELECT start_time FROM appointments WHERE client_id = $1 AND start_time > NOW() ORDER BY start_time ASC LIMIT 3`,
+            [clientId]
+        );
+        return res.rows;
+    } catch (e) { return []; }
+}
+
+async function cancelNextAppointment(clientId) {
+    try {
+        // 1. Buscar la cita más próxima
+        const res = await pool.query(
+            `SELECT id, google_event_id, start_time FROM appointments WHERE client_id = $1 AND start_time > NOW() ORDER BY start_time ASC LIMIT 1`,
+            [clientId]
+        );
+        
+        if (res.rows.length === 0) return { success: false };
+        const cita = res.rows[0];
+
+        // 2. Borrar de Google Calendar
+        await jwtClient.authorize();
+        const calendar = google.calendar({ version: 'v3', auth: jwtClient });
+        try {
+            await calendar.events.delete({
+                calendarId: process.env.GOOGLE_CALENDAR_ID,
+                eventId: cita.google_event_id
+            });
+        } catch (err) { console.error("Error borrando en Google (puede que ya no exista):", err.message); }
+
+        // 3. Borrar de Base de Datos
+        await pool.query(`DELETE FROM appointments WHERE id = $1`, [cita.id]);
+
+        const dateStr = new Date(cita.start_time).toLocaleString('es-CO', { timeZone: 'America/Bogota' });
+        return { success: true, date: dateStr };
+
+    } catch (e) { 
+        console.error(e);
+        return { success: false }; 
+    }
+}
+
+async function rescheduleNextAppointment(clientId, newIsoDate) {
+    try {
+        // 1. Buscar cita vieja
+        const res = await pool.query(
+            `SELECT id, google_event_id FROM appointments WHERE client_id = $1 AND start_time > NOW() ORDER BY start_time ASC LIMIT 1`,
+            [clientId]
+        );
+        
+        if (res.rows.length === 0) return { success: false, reason: 'no_appointment' };
+        const cita = res.rows[0];
+
+        // 2. Calcular nuevos tiempos
+        const start = new Date(newIsoDate);
+        const end = new Date(start.getTime() + 60 * 60 * 1000);
+
+        // 3. Actualizar Google Calendar
+        await jwtClient.authorize();
+        const calendar = google.calendar({ version: 'v3', auth: jwtClient });
+        
+        await calendar.events.patch({
+            calendarId: process.env.GOOGLE_CALENDAR_ID,
+            eventId: cita.google_event_id,
+            resource: {
+                start: { dateTime: start.toISOString() },
+                end: { dateTime: end.toISOString() }
+            }
+        });
+
+        // 4. Actualizar Base de Datos
+        await pool.query(
+            `UPDATE appointments SET start_time = $1, end_time = $2 WHERE id = $3`,
+            [start.toISOString(), end.toISOString(), cita.id]
+        );
+
+        return { success: true };
+
+    } catch (e) {
+        console.error(e);
+        return { success: false, reason: 'error' };
+    }
+}
 
 async function saveChatMessage(clientId, role, content) {
-    try {
-        await pool.query(
-            "INSERT INTO chat_history (client_id, role, content) VALUES ($1, $2, $3)",
-            [clientId, role, content]
-        );
-    } catch (e) { console.error("Error guardando chat:", e.message); }
+    try { await pool.query("INSERT INTO chat_history (client_id, role, content) VALUES ($1, $2, $3)", [clientId, role, content]); } catch (e) {}
 }
 
 async function getChatHistory(clientId) {
     try {
-        // Traer últimos 6 mensajes ordenados cronológicamente
-        const res = await pool.query(
-            "SELECT role, content FROM chat_history WHERE client_id = $1 ORDER BY created_at DESC LIMIT 6",
-            [clientId]
-        );
-        // Invertir para que estén en orden de lectura (antiguo -> nuevo)
-        const rows = res.rows.reverse();
-        
-        // Formatear para Gemini
-        let historyText = "";
-        rows.forEach(msg => {
-            historyText += `${msg.role === 'user' ? 'Cliente' : 'Barbero'}: ${msg.content}\n`;
-        });
-        return historyText;
+        const res = await pool.query("SELECT role, content FROM chat_history WHERE client_id = $1 ORDER BY created_at DESC LIMIT 5", [clientId]);
+        return res.rows.reverse().map(m => `${m.role==='user'?'Cliente':'Barbero'}: ${m.content}`).join("\n");
     } catch (e) { return ""; }
 }
 
-// --- 4. CEREBRO CONTEXTUAL ---
+// --- 4. CEREBRO IA ---
 
 async function talkToGemini(userInput, userName, history) {
     try {
@@ -160,27 +263,23 @@ async function talkToGemini(userInput, userName, history) {
         const now = new Date().toLocaleString("es-CO", { timeZone: "America/Bogota" });
 
         const prompt = `
-            Eres el dueño de la barbería "Alpelo" en Colombia.
-            Cliente: ${userName}.
-            Hora actual: ${now}.
+            Eres el dueño de la barbería "Alpelo". Cliente: ${userName}. Hora: ${now}.
+            HISTORIAL: ${history}
+            Cliente: "${userInput}"
 
-            HISTORIAL DE CONVERSACIÓN RECIENTE:
-            ${history}
-            
-            Cliente dice ahora: "${userInput}"
+            INTENCIONES:
+            - "booking": Quiere cita NUEVA.
+            - "check": Consulta sus citas.
+            - "cancel": Quiere cancelar o borrar su cita.
+            - "reschedule": Quiere cambiar, mover o posponer su cita (extrae la NUEVA fecha deseada).
+            - "chat": Saludos, dudas.
 
-            INSTRUCCIONES DE PERSONALIDAD:
-            - Responde de forma fluida basándote en el historial. NO saludes de nuevo si ya nos saludamos hace poco.
-            - Si el cliente tiene dudas, respóndele directo y corto.
-            - Usa lenguaje colombiano natural (parcero, listo, de una).
-            - Sé breve. Máximo 2 frases.
-
-            FORMATO JSON OBLIGATORIO:
+            JSON OBLIGATORIO:
             {
-                "intent": "booking" | "chat",
-                "date": "ISO_DATE" (si pide cita),
-                "humanDate": "Texto legible",
-                "reply": "Tu respuesta contextual"
+                "intent": "booking" | "check" | "cancel" | "reschedule" | "chat",
+                "date": "ISO_DATE" (para booking/reschedule),
+                "humanDate": "Texto fecha",
+                "reply": "Respuesta contextual"
             }
         `;
 
@@ -192,19 +291,13 @@ async function talkToGemini(userInput, userName, history) {
 }
 
 // --- 5. AUXILIARES ---
-
 async function checkCalendar(isoDate) {
     try {
         await jwtClient.authorize();
         const calendar = google.calendar({ version: 'v3', auth: jwtClient });
         const start = new Date(isoDate);
         const end = new Date(start.getTime() + 60 * 60 * 1000);
-        const res = await calendar.events.list({
-            calendarId: process.env.GOOGLE_CALENDAR_ID,
-            timeMin: start.toISOString(),
-            timeMax: end.toISOString(),
-            singleEvents: true
-        });
+        const res = await calendar.events.list({ calendarId: process.env.GOOGLE_CALENDAR_ID, timeMin: start.toISOString(), timeMax: end.toISOString(), singleEvents: true });
         return res.data.items.filter(e => e.status !== 'cancelled').length > 0 ? 'busy' : 'free';
     } catch (e) { return 'error'; }
 }
@@ -215,22 +308,11 @@ async function saveBooking(isoDate, phone, userId, name) {
         const calendar = google.calendar({ version: 'v3', auth: jwtClient });
         const start = new Date(isoDate);
         const end = new Date(start.getTime() + 60 * 60 * 1000);
-
         const gRes = await calendar.events.insert({
             calendarId: process.env.GOOGLE_CALENDAR_ID,
-            resource: {
-                summary: `Cita: ${name}`,
-                description: `WhatsApp: ${phone}`,
-                start: { dateTime: start.toISOString() },
-                end: { dateTime: end.toISOString() },
-                colorId: '2'
-            }
+            resource: { summary: `Cita: ${name}`, description: `WhatsApp: ${phone}`, start: { dateTime: start.toISOString() }, end: { dateTime: end.toISOString() } }
         });
-
-        await pool.query(
-            "INSERT INTO appointments (id, client_id, start_time, end_time, google_event_id) VALUES ($1, $2, $3, $4, $5)",
-            [crypto.randomUUID(), userId, start.toISOString(), end.toISOString(), gRes.data.id]
-        );
+        await pool.query("INSERT INTO appointments (id, client_id, start_time, end_time, google_event_id) VALUES ($1, $2, $3, $4, $5)", [crypto.randomUUID(), userId, start.toISOString(), end.toISOString(), gRes.data.id]);
         return true;
     } catch (e) { return false; }
 }
@@ -240,8 +322,8 @@ async function sendToWhatsApp(to, text) {
         await axios.post(`https://graph.facebook.com/v18.0/${process.env.META_PHONE_ID}/messages`, {
             messaging_product: 'whatsapp', to, text: { body: text }
         }, { headers: { 'Authorization': `Bearer ${process.env.META_TOKEN}` } });
-    } catch (e) { console.error("Error WhatsApp:", e.message); }
+    } catch (e) {}
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 BarberBot V21 (Memoria) Online`));
+app.listen(PORT, () => console.log(`🚀 BarberBot V23 (Gestión Total) Online`));
