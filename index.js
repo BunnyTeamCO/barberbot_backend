@@ -43,7 +43,9 @@ app.get('/webhook', (req, res) => {
 });
 
 app.post('/webhook', async (req, res) => {
+  // Siempre responder 200 a Meta primero
   res.sendStatus(200);
+
   const body = req.body;
   if (!body.object || !body.entry?.[0]?.changes?.[0]?.value?.messages?.[0]) return;
 
@@ -52,7 +54,7 @@ app.post('/webhook', async (req, res) => {
   const text = (message.text ? message.text.body : '').trim();
 
   try {
-    // COMANDO RESET (Para pruebas)
+    // COMANDO RESET
     if (text.toLowerCase() === '/reset') {
         await pool.query("DELETE FROM clients WHERE phone_number = $1", [from]);
         await sendToWhatsApp(from, "🔄 Memoria borrada. Escríbeme 'Hola' para empezar de nuevo.");
@@ -62,33 +64,32 @@ app.post('/webhook', async (req, res) => {
     // A. Identificar usuario
     const userRes = await pool.query('SELECT id, full_name, conversation_state FROM clients WHERE phone_number = $1', [from]);
     
-    // B. FLUJO DE BIENVENIDA ESTRICTO
+    // B. FLUJO DE BIENVENIDA
     if (userRes.rows.length === 0) {
-        // Nuevo usuario: Registrar y pedir nombre
         await pool.query(
             "INSERT INTO clients (id, phone_number, conversation_state) VALUES ($1, $2, 'WAITING_NAME')",
             [crypto.randomUUID(), from]
         );
-        await sendToWhatsApp(from, "💈 ¡Hola! Bienvenido a *Alpelo*.\n\nQué nota saludarte. Para poder atenderte bien, **¿me regalas tu nombre?**");
+        await sendToWhatsApp(from, "💈 ¡Hola! Bienvenido a *Alpelo*.\n\nQué nota saludarte. Antes de empezar, **¿cómo es tu nombre?**");
         return;
     }
 
     const user = userRes.rows[0];
 
-    // C. CAPTURAR NOMBRE SI ESTÁ PENDIENTE
+    // C. CAPTURAR NOMBRE
     if (user.conversation_state === 'WAITING_NAME') {
         const cleanName = text.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
         if (cleanName.length < 3) {
-            await sendToWhatsApp(from, "¡No seas tímido! Dime tu nombre para registrarte. 😉");
+            await sendToWhatsApp(from, "¡No seas tímido! Dime tu nombre para registrarte bien. 😉");
             return;
         }
         await pool.query("UPDATE clients SET full_name = $1, conversation_state = 'ACTIVE' WHERE phone_number = $2", [cleanName, from]);
-        await sendToWhatsApp(from, `¡Un gusto saludarte, *${cleanName}*! 🤝 Ya te tengo en mi sistema.\n\nCuéntame, ¿qué día quieres venir a motilarte? O si tienes dudas de precios, ¡dispara!`);
+        await sendToWhatsApp(from, `¡Un gusto, *${cleanName}*! 🤝 Ya estás en mi sistema.\n\n¿Para cuándo quieres agendar tu cita? O si tienes dudas, ¡dispara!`);
         return;
     }
 
-    // D. CHAT CON INTELIGENCIA ARTIFICIAL (HUMANIZADA)
-    const clientName = user.full_name;
+    // D. CHAT CON IA
+    const clientName = user.full_name || "Amigo";
     const ai = await talkToGemini(text, clientName);
     console.log(`🧠 IA responde a ${clientName}: ${ai.intent}`);
 
@@ -112,10 +113,14 @@ app.post('/webhook', async (req, res) => {
 
   } catch (error) {
     console.error("❌ ERROR CRÍTICO:", error.message);
+    // Intentar avisar al usuario si algo sale mal
+    try {
+        await sendToWhatsApp(from, "Lo siento, tuve un problema interno. 😵‍💫 ¿Puedes intentar escribirme de nuevo?");
+    } catch (e) {}
   }
 });
 
-// --- FUNCIONES IA (PERSONALIDAD ALPELO) ---
+// --- FUNCIONES IA ---
 
 async function talkToGemini(userInput, userName) {
     try {
@@ -128,11 +133,10 @@ async function talkToGemini(userInput, userName) {
             Hora actual en Colombia: ${now}.
             Mensaje del cliente: "${userInput}"
 
-            TU PERSONALIDAD:
-            - Habla como un barbero amable y "parcero" (parcero, qué nota, de una, un gusto, a la orden).
-            - NO seas repetitivo. Si te saludan o agradecen, varía tu respuesta para sonar humano.
-            - Sé proactivo: Si él quiere cita, ayúdalo a encontrar el espacio. 
-            - Si el usuario dice cosas cortas como "si", "ok", "vale", responde de forma natural continuando la charla.
+            PERSONALIDAD:
+            - Habla como un barbero amable y profesional (parcero, qué nota, de una, un gusto).
+            - NO seas repetitivo. Si el usuario solo saluda, responde variado.
+            - Si el usuario dice cosas cortas como "si" o "ok", continúa la charla de forma natural preguntando si quiere agendar algo.
 
             REGLA DE ORO: Responde siempre en JSON puro:
             {
@@ -144,10 +148,9 @@ async function talkToGemini(userInput, userName) {
         `;
 
         const result = await model.generateContent(prompt);
-        const resText = result.response.text().replace(/```json|```/g, '').trim();
-        return JSON.parse(resText);
+        return JSON.parse(result.response.text().replace(/```json|```/g, '').trim());
     } catch (e) {
-        return { intent: "chat", reply: `¡Qué hubo ${userName}! ¿En qué te colaboro hoy?` };
+        return { intent: "chat", reply: `¡Qué hubo! ¿En qué te colaboro hoy?` };
     }
 }
 
@@ -205,4 +208,4 @@ async function sendToWhatsApp(to, text) {
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 BarberBot V18 (Cerebro Humano) Online`));
+app.listen(PORT, () => console.log(`🚀 BarberBot V19 Online`));
