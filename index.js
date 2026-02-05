@@ -9,7 +9,7 @@ const { google } = require('googleapis');
 const app = express();
 app.use(bodyParser.json());
 
-// --- CONFIGURACIÓN ---
+// --- 1. CONFIGURACIÓN ---
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: false 
@@ -32,7 +32,7 @@ const jwtClient = new google.auth.JWT(
   ['https://www.googleapis.com/auth/calendar']
 );
 
-// --- RUTAS ---
+// --- 2. RUTAS ---
 app.get('/webhook', (req, res) => {
   if (req.query['hub.verify_token'] === process.env.META_VERIFY_TOKEN) {
     res.status(200).send(req.query['hub.challenge']);
@@ -48,76 +48,67 @@ app.post('/webhook', async (req, res) => {
   if (body.object && body.entry?.[0]?.changes?.[0]?.value?.messages?.[0]) {
     const message = body.entry[0].changes[0].value.messages[0];
     const from = message.from; 
-    const text = message.text ? message.text.body : '';
+    const text = (message.text ? message.text.body : '').trim();
 
     console.log(`📩 Mensaje de ${from}: ${text}`);
 
     try {
-      // COMANDO SECRETO: Reiniciar usuario para pruebas
+      // COMANDO DE RESCATE
       if (text.toLowerCase() === '/reset') {
           await resetUser(from);
-          await sendToWhatsApp(from, "🔄 Memoria reiniciada. Escríbeme 'Hola' para empezar de cero.");
+          await sendToWhatsApp(from, "🔄 He borrado tu registro. Escríbeme cualquier cosa para empezar de nuevo.");
           return;
       }
 
-      // 1. GESTIÓN DE ESTADO
-      const userState = await checkUserState(from);
+      // --- PASO A: IDENTIFICAR QUIÉN ES EL USUARIO ---
+      const user = await getDetailedUserState(from);
 
-      // CASO A: Usuario Nuevo -> Saludar y Pedir Nombre
-      if (userState.status === 'NEW') {
-          await initializeUser(from);
-          await sendToWhatsApp(from, "👋 ¡Hola! Bienvenido a *Alpelo*.\n\nSoy tu asistente virtual. Para atenderte como te mereces, **¿me regalas tu nombre?**");
-          return; 
-      }
-
-      // CASO B: Usuario "Roto" (Existía pero sin nombre válido)
-      if (userState.status === 'FORCE_UPDATE') {
-          await sendToWhatsApp(from, "Disculpa, estoy actualizando mi agenda y no encuentro tu nombre. 🙏 **¿Me lo podrías escribir nuevamente?**");
+      // ESCENARIO 1: No existe en la base de datos
+      if (user.status === 'NOT_FOUND') {
+          await createInitialUser(from);
+          await sendToWhatsApp(from, "👋 ¡Hola! Te comunicas con *Alpelo*.\n\nAntes de empezar, **¿cómo es tu nombre?** (Escríbelo aquí abajo)");
           return;
       }
 
-      // CASO C: Esperando Nombre -> Guardar
-      if (userState.status === 'WAITING_NAME') {
-          const newName = text.trim();
-          if (newName.length < 3) {
-             await sendToWhatsApp(from, "Ese nombre es muy corto. 🤔 ¿Cómo te llamas realmente?");
-             return;
+      // ESCENARIO 2: Existe pero no nos ha dado el nombre (conversation_state = 'WAITING_NAME')
+      if (user.status === 'WAITING_NAME') {
+          if (text.length < 3) {
+              await sendToWhatsApp(from, "No seas tímido, ¡dime tu nombre completo para registrarte bien! 😉");
+              return;
           }
-          await updateUserName(from, newName);
-          await sendToWhatsApp(from, `¡Listo ${newName}! Un gusto saludarte. 🤝\n\nCuéntame, ¿qué necesitas? Puedes pedirme una cita (ej: "mañana a las 4pm") o preguntarme horarios.`);
+          await saveNameAndActivate(from, text);
+          await sendToWhatsApp(from, `¡Qué nota saludarte, *${text}*! 🤝 Ya estás en mi sistema.\n\nAhora sí, ¿en qué te puedo colaborar? Puedo agendarte una cita o decirte qué servicios tenemos.`);
           return;
       }
 
-      // CASO D: Usuario Activo -> Hablar con IA
-      const clientName = userState.name; 
-      const aiAnalysis = await analyzeWithGemini(text, clientName);
-      console.log("🧠 IA:", JSON.stringify(aiAnalysis));
+      // ESCENARIO 3: Usuario Activo -> Hablar con Gemini
+      const clientName = user.name;
+      const aiResponse = await talkToGemini(text, clientName);
+      console.log("🧠 Respuesta IA:", JSON.stringify(aiResponse));
 
-      let finalResponse = "";
+      let messageToSend = "";
 
-      if (aiAnalysis.intent === 'booking' && aiAnalysis.date) {
-        // Verificar Disponibilidad
-        const availability = await checkRealAvailability(aiAnalysis.date);
-        
-        if (availability.status === 'error') {
-            finalResponse = `🔧 Tuve un problema técnico revisando la agenda. Intenta en un momento.`;
-            console.error(availability.message);
-        } else if (availability.status === 'busy') {
-            finalResponse = `Uff ${clientName}, justo a esa hora (${aiAnalysis.humanDate}) ya estoy ocupado. 😅 ¿Te sirve una hora antes o después?`;
-        } else {
-            // Agendar
-            const booking = await crearEventoCompleto(aiAnalysis.date, from, clientName);
-            if (booking.status === 'success') {
-                finalResponse = `✅ ¡Agendado, ${clientName}!\n\nTe espero el *${aiAnalysis.humanDate}*.`;
-            } else {
-                finalResponse = `No pude guardar la cita por un error técnico. 😞`;
-            }
-        }
+      if (aiResponse.intent === 'booking' && aiResponse.date) {
+          // Lógica de agendamiento
+          const availability = await checkRealAvailability(aiResponse.date);
+          
+          if (availability.status === 'busy') {
+              messageToSend = `Uff ${clientName}, a esa hora (${aiResponse.humanDate}) ya estoy ocupado. 😅 ¿De pronto te sirve un poquito más tarde?`;
+          } else if (availability.status === 'error') {
+              messageToSend = `Tuve un problema revisando la agenda, ¿puedes intentar en un minuto? 🙏`;
+          } else {
+              // Agendar
+              const success = await createFinalBooking(aiResponse.date, from, clientName);
+              messageToSend = success 
+                ? `✅ ¡Listo, *${clientName}*! Te espero el *${aiResponse.humanDate}*. ¡Allá nos vemos!` 
+                : `Lo siento, no pude guardar la cita en el calendario.`;
+          }
       } else {
-        finalResponse = aiAnalysis.reply;
+          // Respuesta normal de chat
+          messageToSend = aiResponse.reply;
       }
 
-      await sendToWhatsApp(from, finalResponse);
+      await sendToWhatsApp(from, messageToSend);
 
     } catch (error) {
       console.error("❌ Error General:", error);
@@ -125,174 +116,133 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// --- 3. FUNCIONES DE ESTADO ---
+// --- 3. FUNCIONES DE BASE DE DATOS ---
 
-async function resetUser(phone) {
-    await pool.query('DELETE FROM appointments WHERE client_id IN (SELECT id FROM clients WHERE phone_number = $1)', [phone]);
-    await pool.query('DELETE FROM clients WHERE phone_number = $1', [phone]);
-    console.log(`🗑️ Usuario ${phone} reseteado.`);
-}
-
-async function checkUserState(phone) {
-    try {
-        const res = await pool.query('SELECT conversation_state, full_name FROM clients WHERE phone_number = $1', [phone]);
-        
-        if (res.rows.length === 0) {
-            return { status: 'NEW' };
-        }
-
-        const userData = res.rows[0];
-        
-        // Si está marcado como WAITING_NAME en la BD, devolver ese estado
-        if (userData.conversation_state === 'WAITING_NAME') {
-            return { status: 'WAITING_NAME' };
-        }
-
-        // AUTO-REPARACIÓN: Si está "ACTIVE" pero no tiene nombre válido
-        if (!userData.full_name || userData.full_name === 'undefined' || userData.full_name.trim().length < 2) {
-            console.log(`⚠️ Usuario ${phone} sin nombre válido. Forzando petición.`);
-            // Cambiamos estado en BD a WAITING_NAME para que el PRÓXIMO mensaje lo capture como nombre
-            await pool.query("UPDATE clients SET conversation_state = 'WAITING_NAME' WHERE phone_number = $1", [phone]);
-            return { status: 'FORCE_UPDATE' }; // Devolvemos estado especial para pedir nombre AHORA
-        }
-
-        return { 
-            status: 'ACTIVE', 
-            name: userData.full_name 
-        };
-    } catch (e) {
-        console.error("DB Error:", e);
-        return { status: 'ACTIVE', name: 'Amigo' }; // Fallback de emergencia
+async function getDetailedUserState(phone) {
+    const res = await pool.query('SELECT full_name, conversation_state FROM clients WHERE phone_number = $1', [phone]);
+    if (res.rows.length === 0) return { status: 'NOT_FOUND' };
+    
+    const row = res.rows[0];
+    if (row.conversation_state === 'WAITING_NAME' || !row.full_name || row.full_name === 'undefined') {
+        return { status: 'WAITING_NAME' };
     }
+    
+    return { status: 'ACTIVE', name: row.full_name };
 }
 
-async function initializeUser(phone) {
+async function createInitialUser(phone) {
     await pool.query(
-        `INSERT INTO clients (id, phone_number, conversation_state) VALUES (gen_random_uuid(), $1, 'WAITING_NAME')`,
+        "INSERT INTO clients (id, phone_number, conversation_state) VALUES (gen_random_uuid(), $1, 'WAITING_NAME')",
         [phone]
     );
 }
 
-async function updateUserName(phone, name) {
+async function saveNameAndActivate(phone, name) {
     await pool.query(
-        `UPDATE clients SET full_name = $1, conversation_state = 'ACTIVE' WHERE phone_number = $2`,
+        "UPDATE clients SET full_name = $1, conversation_state = 'ACTIVE' WHERE phone_number = $2",
         [name, phone]
     );
 }
 
-// --- 4. INTELIGENCIA ARTIFICIAL (HUMANIZADA) ---
-
-async function analyzeWithGemini(userText, userName) {
-  try {
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" }); 
-    const nowCol = new Date().toLocaleString("es-CO", { timeZone: "America/Bogota" });
-    
-    // Prompt "Parcero"
-    const prompt = `
-      Actúa como el asistente de la barbería "Alpelo" en Colombia. 
-      Hablas con: ${userName}.
-      Fecha y hora actual: ${nowCol}.
-      Mensaje del usuario: "${userText}"
-      
-      PERSONALIDAD:
-      - Eres amable, profesional pero cercano (estilo colombiano educado).
-      - NO seas repetitivo. Si el usuario solo saluda, no le preguntes "¿en qué te ayudo?" 5 veces seguidas. Varía tu respuesta.
-      - Si el usuario dice "Gracias", responde con "Con gusto", "A la orden", etc.
-      
-      INSTRUCCIONES CLAVE:
-      1. Si el usuario quiere cita (ej: "cita mañana a las 3", "tienes espacio el viernes"), extrae la fecha ISO (YYYY-MM-DDTHH:mm:ss-05:00).
-      2. Si solo saluda ("Hola", "Buenas"), saluda de vuelta usando su nombre y espera a que él pida.
-      
-      Responde SOLO JSON:
-      {
-        "intent": "booking" | "chat",
-        "date": "ISO"|null,
-        "humanDate": "Ej: Viernes 3pm" (o null),
-        "reply": "Texto de respuesta natural" (o null)
-      }
-    `;
-
-    const result = await model.generateContent(prompt);
-    const text = result.response.text().replace(/```json|```/g, '').trim();
-    return JSON.parse(text);
-  } catch (e) {
-    return { intent: "chat", reply: `Hola ${userName}, cuéntame, ¿qué necesitas hoy?` };
-  }
+async function resetUser(phone) {
+    await pool.query("DELETE FROM appointments WHERE client_id IN (SELECT id FROM clients WHERE phone_number = $1)", [phone]);
+    await pool.query("DELETE FROM clients WHERE phone_number = $1", [phone]);
 }
 
-// ... (Resto de funciones: checkRealAvailability, crearEventoCompleto, sendToWhatsApp se mantienen IGUAL que la V10)
-// Copia las funciones auxiliares de la versión anterior o asegúrate de que estén en el archivo.
-// AQUI LAS PONGO PARA QUE SEA COPY-PASTE COMPLETO:
+// --- 4. CEREBRO GEMINI (NUEVA PERSONALIDAD) ---
 
-async function saveAppointmentToDB(clientPhone, startTime, endTime, googleId) {
+async function talkToGemini(userInput, userName) {
     try {
-        const res = await pool.query('SELECT id FROM clients WHERE phone_number = $1', [clientPhone]);
-        if (res.rows.length > 0) {
-            const clientId = res.rows[0].id;
-            await pool.query(
-                `INSERT INTO appointments (id, client_id, start_time, end_time, status, google_event_id, service_type) 
-                 VALUES (gen_random_uuid(), $1, $2, $3, 'confirmed', $4, 'Corte General')`,
-                [clientId, startTime, endTime, googleId]
-            );
-        }
-    } catch (e) { console.error("DB Error:", e); }
+        const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+        const now = new Date().toLocaleString("es-CO", { timeZone: "America/Bogota" });
+
+        const prompt = `
+            Eres el barbero dueño de la barbería "Alpelo" en Colombia.
+            Tu cliente se llama: ${userName}.
+            Hora actual: ${now}.
+            Él te dice: "${userInput}"
+
+            TU PERSONALIDAD:
+            - Hablas con estilo colombiano (parcero, qué nota, de una, un gusto).
+            - Eres PROACTIVO. Si él dice "Hola", no solo digas hola; dile que estás listo para motilarlo o agendarlo.
+            - NO repitas la misma frase dos veces. Sé natural.
+            - Si pide cita, debes extraer la fecha.
+
+            REGLA DE ORO: Responde SIEMPRE en este formato JSON (sin markdown):
+            {
+                "intent": "booking" o "chat",
+                "date": "ISO_DATE" (si es booking),
+                "humanDate": "Texto legible",
+                "reply": "Tu respuesta al cliente (si es chat o respuesta de error)"
+            }
+        `;
+
+        const result = await model.generateContent(prompt);
+        const text = result.response.text().replace(/```json|```/g, '').trim();
+        return JSON.parse(text);
+    } catch (e) {
+        return { intent: "chat", reply: `¡Hola ${userName}! ¿Qué más de cosas? ¿En qué te puedo ayudar hoy?` };
+    }
 }
 
-async function checkRealAvailability(isoDateStart) {
+// --- 5. FUNCIONES AUXILIARES (Calendario & WhatsApp) ---
+
+async function checkRealAvailability(isoDate) {
     try {
         await jwtClient.authorize();
         const calendar = google.calendar({ version: 'v3', auth: jwtClient });
-        const start = new Date(isoDateStart);
+        const start = new Date(isoDate);
         const end = new Date(start.getTime() + 60 * 60 * 1000);
-
         const res = await calendar.events.list({
             calendarId: process.env.GOOGLE_CALENDAR_ID,
             timeMin: start.toISOString(),
             timeMax: end.toISOString(),
             singleEvents: true
         });
-        const activeEvents = res.data.items.filter(e => e.status !== 'cancelled');
-        return activeEvents.length > 0 ? { status: 'busy' } : { status: 'free' };
-    } catch (error) {
-        return { status: 'error', message: error.message };
-    }
+        const active = res.data.items.filter(e => e.status !== 'cancelled');
+        return active.length > 0 ? { status: 'busy' } : { status: 'free' };
+    } catch (e) { return { status: 'error', message: e.message }; }
 }
 
-async function crearEventoCompleto(isoDateStart, clientPhone, clientName) {
+async function createFinalBooking(isoDate, phone, name) {
     try {
         await jwtClient.authorize();
         const calendar = google.calendar({ version: 'v3', auth: jwtClient });
-        const start = new Date(isoDateStart);
-        const end = new Date(start.getTime() + 60 * 60 * 1000); 
+        const start = new Date(isoDate);
+        const end = new Date(start.getTime() + 60 * 60 * 1000);
 
         const googleRes = await calendar.events.insert({
             calendarId: process.env.GOOGLE_CALENDAR_ID,
             resource: {
-                summary: `Cita: ${clientName}`,
-                description: `Cliente: ${clientPhone}`,
+                summary: `Cita: ${name}`,
+                description: `WhatsApp: ${phone}`,
                 start: { dateTime: start.toISOString() },
                 end: { dateTime: end.toISOString() },
                 colorId: '2'
-            },
+            }
         });
-        
-        await saveAppointmentToDB(clientPhone, start.toISOString(), end.toISOString(), googleRes.data.id);
-        return { status: 'success' };
-    } catch (error) {
-        return { status: 'error', error: error.message };
-    }
+
+        // Guardar en DB SQL
+        const clientRes = await pool.query('SELECT id FROM clients WHERE phone_number = $1', [phone]);
+        if (clientRes.rows.length > 0) {
+            await pool.query(
+                "INSERT INTO appointments (id, client_id, start_time, end_time, google_event_id) VALUES (gen_random_uuid(), $1, $2, $3, $4)",
+                [clientRes.rows[0].id, start.toISOString(), end.toISOString(), googleRes.data.id]
+            );
+        }
+        return true;
+    } catch (e) { return false; }
 }
 
-async function sendToWhatsApp(to, textBody) {
+async function sendToWhatsApp(to, text) {
     try {
-        await axios({
-            method: 'POST',
-            url: `https://graph.facebook.com/v18.0/${process.env.META_PHONE_ID}/messages`,
-            headers: { 'Authorization': `Bearer ${process.env.META_TOKEN}`, 'Content-Type': 'application/json' },
-            data: { messaging_product: 'whatsapp', to: to, text: { body: textBody } }
-        });
-    } catch (error) { console.error("Error envío WhatsApp", error.message); }
+        await axios.post(`https://graph.facebook.com/v18.0/${process.env.META_PHONE_ID}/messages`, {
+            messaging_product: 'whatsapp',
+            to: to,
+            text: { body: text }
+        }, { headers: { 'Authorization': `Bearer ${process.env.META_TOKEN}` } });
+    } catch (e) { console.error("Error WhatsApp:", e.message); }
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => { console.log(`🚀 BarberBot V11 (Humanizado) puerto ${PORT}`); });
+app.listen(PORT, () => console.log(`🚀 BarberBot V12 (Humanizado) en puerto ${PORT}`));
