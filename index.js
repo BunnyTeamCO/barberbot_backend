@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
-const { Pool } = require('pg'); // Cliente de Base de Datos
+const { Pool } = require('pg');
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const { google } = require('googleapis');
 
@@ -11,10 +11,10 @@ app.use(bodyParser.json());
 
 // --- 1. CONFIGURACIÓN ---
 
-// A. Base de Datos
+// A. Base de Datos (CORREGIDO)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false } // Necesario para conexiones remotas
+  ssl: false // <--- CAMBIO CRÍTICO: Desactivamos SSL para red interna de Coolify
 });
 
 // B. Inteligencia Artificial
@@ -52,7 +52,7 @@ app.post('/webhook', async (req, res) => {
   if (body.object && body.entry?.[0]?.changes?.[0]?.value?.messages?.[0]) {
     const message = body.entry[0].changes[0].value.messages[0];
     const from = message.from; 
-    const fromName = message.push_name || "Cliente Nuevo"; // Nombre de WhatsApp
+    const fromName = message.push_name || "Cliente Nuevo";
     const text = message.text ? message.text.body : '';
 
     console.log(`📩 Mensaje de ${fromName} (${from}): ${text}`);
@@ -96,17 +96,12 @@ app.post('/webhook', async (req, res) => {
 
 // --- 3. FUNCIONES DE BASE DE DATOS ---
 
-// Busca al cliente por teléfono, si no existe lo crea
 async function getOrCreateClient(phone, name) {
     try {
-        // Buscar
         const res = await pool.query('SELECT id FROM clients WHERE phone_number = $1', [phone]);
         if (res.rows.length > 0) {
             return res.rows[0].id;
         }
-        
-        // Crear
-        // NOTA: Usamos gen_random_uuid() porque tu DB es PostgreSQL 17
         const insert = await pool.query(
             'INSERT INTO clients (id, phone_number, full_name) VALUES (gen_random_uuid(), $1, $2) RETURNING id',
             [phone, name]
@@ -129,7 +124,6 @@ async function saveAppointmentToDB(clientId, startTime, endTime, googleId) {
         console.log("💾 Cita guardada en PostgreSQL");
     } catch (e) {
         console.error("Error DB Cita:", e);
-        // No lanzamos error para no romper el flujo si falla solo la DB local
     }
 }
 
@@ -137,10 +131,9 @@ async function saveAppointmentToDB(clientId, startTime, endTime, googleId) {
 
 async function crearEventoCompleto(isoDateStart, clientPhone, clientName) {
     try {
-        // A. Crear en Google Calendar
+        // A. Google Calendar
         await jwtClient.authorize();
         const calendar = google.calendar({ version: 'v3', auth: jwtClient });
-        
         const start = new Date(isoDateStart);
         const end = new Date(start.getTime() + 60 * 60 * 1000); 
 
@@ -157,11 +150,9 @@ async function crearEventoCompleto(isoDateStart, clientPhone, clientName) {
             resource: event,
         });
         
-        const googleEventId = googleRes.data.id;
-
-        // B. Guardar en Base de Datos (PostgreSQL)
+        // B. Base de Datos
         const clientId = await getOrCreateClient(clientPhone, clientName);
-        await saveAppointmentToDB(clientId, start.toISOString(), end.toISOString(), googleEventId);
+        await saveAppointmentToDB(clientId, start.toISOString(), end.toISOString(), googleRes.data.id);
 
         return { status: 'success' };
 
@@ -171,14 +162,12 @@ async function crearEventoCompleto(isoDateStart, clientPhone, clientName) {
     }
 }
 
-// --- RESTO DE FUNCIONES (Gemini, CheckAvailability, WhatsApp) ---
-// (Estas se mantienen igual que la V6, pero las incluyo para que el archivo sea copy-paste)
+// --- RESTO DE FUNCIONES ---
 
 async function analyzeWithGemini(userText) {
   try {
     const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" }); 
     const nowCol = new Date().toLocaleString("es-CO", { timeZone: "America/Bogota" });
-    
     const prompt = `
       Eres BarberBot. Fecha actual en Colombia: ${nowCol}.
       Usuario: "${userText}"
@@ -187,7 +176,6 @@ async function analyzeWithGemini(userText) {
       2. Si saluda, responde amable.
       Responde JSON: { "intent": "booking"|"chat", "date": "ISO"|null, "humanDate": "Texto"|null, "reply": "Texto"|null }
     `;
-
     const result = await model.generateContent(prompt);
     const text = result.response.text().replace(/```json|```/g, '').trim();
     return JSON.parse(text);
@@ -202,14 +190,12 @@ async function checkRealAvailability(isoDateStart) {
         const calendar = google.calendar({ version: 'v3', auth: jwtClient });
         const start = new Date(isoDateStart);
         const end = new Date(start.getTime() + 60 * 60 * 1000);
-
         const res = await calendar.events.list({
             calendarId: process.env.GOOGLE_CALENDAR_ID,
             timeMin: start.toISOString(),
             timeMax: end.toISOString(),
             singleEvents: true
         });
-
         const activeEvents = res.data.items.filter(e => e.status !== 'cancelled');
         return activeEvents.length > 0 ? { status: 'busy' } : { status: 'free' };
     } catch (error) {
@@ -229,4 +215,4 @@ async function sendToWhatsApp(to, textBody) {
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => { console.log(`🚀 BarberBot V7 (Full DB) corriendo en puerto ${PORT}`); });
+app.listen(PORT, () => { console.log(`🚀 BarberBot V8 (SSL Fix) corriendo en puerto ${PORT}`); });
