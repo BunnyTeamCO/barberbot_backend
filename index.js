@@ -12,7 +12,7 @@ app.use(bodyParser.json());
 // --- 1. CONFIGURACIÓN ---
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: false // Sin SSL para red interna Coolify
+  ssl: false 
 });
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -53,7 +53,7 @@ app.post('/webhook', async (req, res) => {
     console.log(`📩 Mensaje de ${from}: ${text}`);
 
     try {
-      // --- PASO A: IDENTIFICAR ESTADO ---
+      // --- PASO A: GESTIÓN DE ESTADO INTELIGENTE ---
       const userState = await checkUserState(from);
 
       // CASO 1: NUEVO -> Bienvenida
@@ -63,7 +63,7 @@ app.post('/webhook', async (req, res) => {
           return; 
       }
 
-      // CASO 2: ESPERANDO NOMBRE -> Guardar
+      // CASO 2: ESPERANDO NOMBRE (O REPARACIÓN) -> Guardar
       if (userState.status === 'WAITING_NAME') {
           const newName = text.trim(); 
           if (newName.length < 2) {
@@ -71,12 +71,14 @@ app.post('/webhook', async (req, res) => {
              return;
           }
           await updateUserName(from, newName);
-          await sendToWhatsApp(from, `¡Un gusto, ${newName}! 🤝 Ya te registré.\n\nAhora sí, ¿en qué te puedo ayudar? (Ej: "Quiero una cita mañana")`);
+          await sendToWhatsApp(from, `¡Un gusto, ${newName}! 🤝 Ya actualicé tu registro.\n\nAhora sí, ¿en qué te puedo ayudar? (Ej: "Quiero una cita mañana")`);
           return;
       }
 
       // CASO 3: ACTIVO -> Flujo IA
-      const clientName = userState.name; 
+      // Corrección Defensiva: Si por alguna razón el nombre es null, usamos "Amigo"
+      const clientName = userState.name || "Amigo"; 
+      
       const aiAnalysis = await analyzeWithGemini(text, clientName);
       console.log("🧠 IA:", JSON.stringify(aiAnalysis));
 
@@ -109,71 +111,68 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// --- 3. FUNCIONES BD (Estado) - NOMBRES CORREGIDOS ---
+// --- 3. FUNCIONES BD (Estado y Reparación) ---
 
 async function checkUserState(phone) {
     try {
-        // CORRECCIÓN: Aseguramos tabla 'clients'
         const res = await pool.query('SELECT conversation_state, full_name FROM clients WHERE phone_number = $1', [phone]);
+        
         if (res.rows.length === 0) {
             return { status: 'NEW' };
         }
+
+        const userData = res.rows[0];
+
+        // --- LÓGICA DE AUTO-REPARACIÓN ---
+        // Si el usuario existe pero NO tiene nombre (o es "undefined"), lo obligamos a dar el nombre
+        if (!userData.full_name || userData.full_name === 'undefined' || userData.full_name.trim() === '') {
+            console.log(`⚠️ Usuario ${phone} detectado sin nombre. Forzando actualización.`);
+            // Actualizamos DB para ponerlo en espera de nombre
+            await pool.query("UPDATE clients SET conversation_state = 'WAITING_NAME' WHERE phone_number = $1", [phone]);
+            return { status: 'WAITING_NAME' };
+        }
+
         return { 
-            status: res.rows[0].conversation_state || 'ACTIVE', 
-            name: res.rows[0].full_name || 'Amigo'
+            status: userData.conversation_state || 'ACTIVE', 
+            name: userData.full_name 
         };
     } catch (e) {
-        console.error("DB Error (CheckUser):", e.message);
+        console.error("DB Error:", e.message);
         return { status: 'ERROR' }; 
     }
 }
 
 async function initializeUser(phone) {
-    // CORRECCIÓN: Aseguramos tabla 'clients'
     try {
         await pool.query(
             `INSERT INTO clients (id, phone_number, conversation_state) VALUES (gen_random_uuid(), $1, 'WAITING_NAME')`,
             [phone]
         );
-        console.log(`🆕 Usuario ${phone} iniciado`);
-    } catch (e) {
-        console.error("DB Error (InitUser):", e.message);
-    }
+    } catch (e) { console.error(e); }
 }
 
 async function updateUserName(phone, name) {
-    // CORRECCIÓN: Aseguramos tabla 'clients'
     try {
         await pool.query(
             `UPDATE clients SET full_name = $1, conversation_state = 'ACTIVE' WHERE phone_number = $2`,
             [name, phone]
         );
-        console.log(`✅ Usuario ${phone} activado: ${name}`);
-    } catch (e) {
-        console.error("DB Error (UpdateUser):", e.message);
-    }
+        console.log(`✅ Usuario ${phone} actualizado: ${name}`);
+    } catch (e) { console.error(e); }
 }
 
 async function saveAppointmentToDB(clientPhone, startTime, endTime, googleId) {
     try {
-        // CORRECCIÓN: Aseguramos tabla 'clients'
         const res = await pool.query('SELECT id FROM clients WHERE phone_number = $1', [clientPhone]);
-        
         if (res.rows.length > 0) {
             const clientId = res.rows[0].id;
-            // CORRECCIÓN: Aseguramos tabla 'appointments'
             await pool.query(
                 `INSERT INTO appointments (id, client_id, start_time, end_time, status, google_event_id, service_type) 
                  VALUES (gen_random_uuid(), $1, $2, $3, 'confirmed', $4, 'Corte General')`,
                 [clientId, startTime, endTime, googleId]
             );
-            console.log("💾 Cita guardada en DB");
-        } else {
-            console.error("❌ Error: No encontré al cliente en la BD para guardar la cita.");
         }
-    } catch (e) {
-        console.error("DB Error (SaveAppt):", e.message);
-    }
+    } catch (e) { console.error("Error DB Cita:", e); }
 }
 
 // --- 4. FUNCIONES NEGOCIO ---
@@ -183,15 +182,18 @@ async function analyzeWithGemini(userText, userName) {
     const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" }); 
     const nowCol = new Date().toLocaleString("es-CO", { timeZone: "America/Bogota" });
     
+    // Si userName es null, usar "Amigo" en el prompt para evitar "undefined"
+    const safeName = userName || "Amigo";
+
     const prompt = `
       Eres BarberBot de "Alpelo".
-      Hablas con: ${userName}.
+      Hablas con: ${safeName}.
       Fecha actual: ${nowCol}.
       Usuario dice: "${userText}"
       
       REGLAS:
       1. Si pide cita, extrae fecha ISO (YYYY-MM-DDTHH:mm:ss-05:00).
-      2. Usa el nombre "${userName}" para ser amable.
+      2. Usa el nombre "${safeName}" en tu respuesta.
       
       Responde JSON: { "intent": "booking"|"chat", "date": "ISO"|null, "humanDate": "Texto"|null, "reply": "Texto"|null }
     `;
@@ -200,7 +202,7 @@ async function analyzeWithGemini(userText, userName) {
     const text = result.response.text().replace(/```json|```/g, '').trim();
     return JSON.parse(text);
   } catch (e) {
-    return { intent: "chat", reply: `Hola ${userName}, ¿en qué te ayudo?` };
+    return { intent: "chat", reply: `Hola ${userName || 'Amigo'}, ¿en qué te ayudo?` };
   }
 }
 
@@ -234,7 +236,7 @@ async function crearEventoCompleto(isoDateStart, clientPhone, clientName) {
         const googleRes = await calendar.events.insert({
             calendarId: process.env.GOOGLE_CALENDAR_ID,
             resource: {
-                summary: `Cita: ${clientName}`,
+                summary: `Cita: ${clientName || 'Cliente'}`,
                 description: `Cliente: ${clientPhone}`,
                 start: { dateTime: start.toISOString() },
                 end: { dateTime: end.toISOString() },
@@ -261,4 +263,4 @@ async function sendToWhatsApp(to, textBody) {
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => { console.log(`🚀 BarberBot V9 (Correccion Tablas) corriendo en puerto ${PORT}`); });
+app.listen(PORT, () => { console.log(`🚀 BarberBot V10 (Auto-Fix) corriendo en puerto ${PORT}`); });
