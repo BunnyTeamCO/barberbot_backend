@@ -5,7 +5,7 @@ const axios = require('axios');
 const { Pool } = require('pg');
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const { google } = require('googleapis');
-const crypto = require('crypto'); // Nativo de Node.js, no necesita instalarse
+const crypto = require('crypto');
 
 const app = express();
 app.use(bodyParser.json());
@@ -33,7 +33,7 @@ const jwtClient = new google.auth.JWT(
   ['https://www.googleapis.com/auth/calendar']
 );
 
-// --- 2. WEBHOOK ---
+// --- 2. RUTAS WEBHOOK ---
 app.get('/webhook', (req, res) => {
   if (req.query['hub.verify_token'] === process.env.META_VERIFY_TOKEN) {
     res.status(200).send(req.query['hub.challenge']);
@@ -51,82 +51,72 @@ app.post('/webhook', async (req, res) => {
   const from = message.from; 
   const text = (message.text ? message.text.body : '').trim();
 
-  let currentStep = "Iniciando";
-
   try {
     // COMANDO RESET
     if (text.toLowerCase() === '/reset') {
-        currentStep = "Reseteando usuario";
         await pool.query("DELETE FROM clients WHERE phone_number = $1", [from]);
         await sendToWhatsApp(from, "🔄 Memoria borrada. Escríbeme 'Hola' para empezar.");
         return;
     }
 
-    // PASO 1: Buscar usuario
-    currentStep = "Buscando usuario en la base de datos";
-    const userRes = await pool.query('SELECT id, full_name, conversation_state FROM clients WHERE phone_number = $1', [from]);
-    
-    // PASO 2: Registro si es nuevo
-    if (userRes.rows.length === 0) {
-        currentStep = "Registrando nuevo usuario";
-        const newId = crypto.randomUUID(); // Generación nativa segura
+    // A. Identificar usuario (Con manejo de error si la columna no existe)
+    let user = null;
+    try {
+        const userRes = await pool.query('SELECT id, full_name, conversation_state FROM clients WHERE phone_number = $1', [from]);
+        if (userRes.rows.length > 0) {
+            user = userRes.rows[0];
+        }
+    } catch (dbError) {
+        console.error("Error leyendo tabla clients:", dbError.message);
+        await sendToWhatsApp(from, "🔧 Estoy teniendo un problema con mi base de datos. Por favor, avísale al administrador que falta la columna 'conversation_state'.");
+        return;
+    }
+
+    // B. FLUJO DE BIENVENIDA
+    if (!user) {
+        const newId = crypto.randomUUID();
         await pool.query(
             "INSERT INTO clients (id, phone_number, conversation_state) VALUES ($1, $2, 'WAITING_NAME')",
             [newId, from]
         );
-        await sendToWhatsApp(from, "💈 ¡Hola! Bienvenido a *Alpelo*.\n\nQué nota saludarte. Antes de empezar, **¿cómo es tu nombre?**");
+        await sendToWhatsApp(from, "👋 ¡Hola! Bienvenido a *Alpelo*.\n\nQué nota saludarte. Antes de empezar, **¿cómo es tu nombre?**");
         return;
     }
 
-    const user = userRes.rows[0];
-
-    // PASO 3: Capturar nombre si está pendiente
+    // C. CAPTURAR NOMBRE
     if (user.conversation_state === 'WAITING_NAME') {
-        currentStep = "Guardando nombre del usuario";
         const cleanName = text.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
         if (cleanName.length < 3) {
-            await sendToWhatsApp(from, "Dime un nombre un poco más largo, ¡no seas tímido! 😉");
+            await sendToWhatsApp(from, "Dime un nombre un poco más largo para registrarte bien. 😉");
             return;
         }
         await pool.query("UPDATE clients SET full_name = $1, conversation_state = 'ACTIVE' WHERE phone_number = $2", [cleanName, from]);
-        await sendToWhatsApp(from, `¡Qué nota, *${cleanName}*! 🤝 Ya te registré.\n\n¿Qué día quieres venir a motilarte? O si tienes dudas, ¡dime!`);
+        await sendToWhatsApp(from, `¡Qué nota saludarte, *${cleanName}*! 🤝 Ya te registré.\n\n¿Para cuándo quieres agendar tu cita? O si tienes dudas, ¡dispara!`);
         return;
     }
 
-    // PASO 4: Consultar a Gemini (IA)
-    currentStep = "Consultando a la Inteligencia Artificial";
-    const ai = await talkToGemini(text, user.full_name);
-    console.log(`🧠 [${user.full_name}]: ${text} -> ${ai.intent}`);
+    // D. CHAT CON IA
+    const ai = await talkToGemini(text, user.full_name || "Amigo");
+    console.log(`🧠 IA responde a ${user.full_name}: ${ai.intent}`);
 
     let response = ai.reply;
 
-    // PASO 5: Lógica de Citas
     if (ai.intent === 'booking' && ai.date) {
-        currentStep = "Verificando disponibilidad en Google Calendar";
         const calendarStatus = await checkCalendar(ai.date);
-        
         if (calendarStatus === 'busy') {
             response = `Uff ${user.full_name}, esa hora ya la tengo ocupada. 😅 ¿Te sirve un poquito más tarde?`;
         } else if (calendarStatus === 'free') {
-            currentStep = "Guardando cita en Calendario y Base de Datos";
             const booked = await saveBooking(ai.date, from, user.id, user.full_name);
             response = booked 
               ? `✅ ¡Listo, *${user.full_name}*! Agendado para el *${ai.humanDate}*. ¡Allá nos vemos!`
               : `Lo siento, no pude guardar la cita. Intenta de nuevo.`;
-        } else {
-            response = `Tuve un lío técnico con el calendario. ¿Podemos intentar en un minuto?`;
         }
     }
 
-    // PASO 6: Enviar respuesta final
-    currentStep = "Enviando respuesta por WhatsApp";
     await sendToWhatsApp(from, response);
 
   } catch (error) {
-    console.error(`❌ ERROR en paso [${currentStep}]:`, error.message);
-    // Enviar error detallado al usuario para diagnosticar
-    const errorMsg = `⚠️ Error en sistema:\nFallo en: *${currentStep}*\nDetalle: ${error.message}`;
-    await sendToWhatsApp(from, errorMsg);
+    console.error("❌ ERROR CRÍTICO:", error.message);
   }
 });
 
@@ -138,9 +128,9 @@ async function talkToGemini(userInput, userName) {
         const now = new Date().toLocaleString("es-CO", { timeZone: "America/Bogota" });
 
         const prompt = `
-            Eres el barbero y dueño de la barbería "Alpelo" en Colombia. 
+            Eres el barbero dueño de la barbería "Alpelo" en Colombia. 
             Cliente: ${userName}. Hora actual: ${now}.
-            Él te dice: "${userInput}"
+            El cliente dice: "${userInput}"
 
             INSTRUCCIONES:
             - Habla como un barbero amable: "parcero", "qué nota", "de una".
@@ -152,7 +142,7 @@ async function talkToGemini(userInput, userName) {
         const resText = result.response.text().replace(/```json|```/g, '').trim();
         return JSON.parse(resText);
     } catch (e) {
-        throw new Error(`Error en Gemini: ${e.message}`);
+        return { intent: "chat", reply: `¡Qué hubo! ¿En qué te colaboro hoy?` };
     }
 }
 
@@ -212,4 +202,4 @@ async function sendToWhatsApp(to, text) {
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 BarberBot V16 (Diagnóstico) en ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 BarberBot V17 Online`));
