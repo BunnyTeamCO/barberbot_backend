@@ -12,10 +12,11 @@ app.use(bodyParser.json());
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 const getCleanPrivateKey = () => {
-  const key = process.env.GOOGLE_PRIVATE_KEY;
+  let key = process.env.GOOGLE_PRIVATE_KEY;
   if (!key) return '';
-  if (key.includes('-----BEGIN PRIVATE KEY-----') && key.includes('\n')) return key;
-  return key.replace(/\\n/g, '\n');
+  key = key.replace(/^["']|["']$/g, '');
+  key = key.replace(/\\n/g, '\n');
+  return key;
 };
 
 const jwtClient = new google.auth.JWT(
@@ -57,12 +58,19 @@ app.post('/webhook', async (req, res) => {
         const availability = await checkRealAvailability(aiAnalysis.date);
         
         if (availability.status === 'error') {
-            // AQUÍ ESTÁ EL CAMBIO: Te enviará el error técnico exacto
-            finalResponse = `💀 ERROR TÉCNICO EXACTO:\n${availability.rawError}`;
+            finalResponse = `🔧 ERROR TÉCNICO:\n${availability.message}`;
         } else if (availability.status === 'busy') {
-            finalResponse = `⚠️ Ocupado a esa hora (${aiAnalysis.humanDate}). Intenta otra.`;
+            finalResponse = `⚠️ Ya estoy ocupado el ${aiAnalysis.humanDate}. ¿Te sirve otra hora?`;
         } else {
-            finalResponse = `✅ ¡Libre! ${aiAnalysis.humanDate}. ¿Agendamos?`;
+            // 3. ¡AGENDAR REALMENTE! (NUEVO)
+            // Si está libre, creamos el evento de inmediato
+            const booking = await crearEventoCalendario(aiAnalysis.date, from);
+            
+            if (booking.status === 'success') {
+                finalResponse = `✅ ¡Listo! Cita confirmada para el ${aiAnalysis.humanDate}.\n\nTe he agendado con el número ${from}.`;
+            } else {
+                finalResponse = `❌ Error al guardar en Google Calendar:\n${booking.error}`;
+            }
         }
       } else {
         finalResponse = aiAnalysis.reply;
@@ -72,7 +80,6 @@ app.post('/webhook', async (req, res) => {
 
     } catch (error) {
       console.error("❌ Error General:", error);
-      await sendToWhatsApp(from, `Error Crítico del Servidor: ${error.message}`);
     }
   }
 });
@@ -84,9 +91,13 @@ async function analyzeWithGemini(userText) {
     const nowCol = new Date().toLocaleString("es-CO", { timeZone: "America/Bogota" });
     
     const prompt = `
-      Eres BarberBot. Fecha en Colombia: ${nowCol}.
+      Eres BarberBot. Fecha actual en Colombia: ${nowCol}.
       Usuario: "${userText}"
-      REGLA: Si pide cita, extrae fecha ISO (YYYY-MM-DDTHH:mm:ss-05:00).
+      REGLAS:
+      1. Si pide cita (ej: "quiero cita el viernes a las 10am"), extrae la fecha ISO (YYYY-MM-DDTHH:mm:ss-05:00).
+      2. Si solo dice "Si", "Confirmar" o "Dale", asume que quiere confirmar lo anterior, pero como no tengo memoria, responde: "Por favor repíteme la fecha y hora completa para agendarte".
+      3. Si saluda, responde amable.
+      
       Responde JSON: { "intent": "booking"|"chat", "date": "ISO"|null, "humanDate": "Texto"|null, "reply": "Texto"|null }
     `;
 
@@ -103,7 +114,7 @@ async function checkRealAvailability(isoDateStart) {
         await jwtClient.authorize();
         const calendar = google.calendar({ version: 'v3', auth: jwtClient });
         const start = new Date(isoDateStart);
-        const end = new Date(start.getTime() + 60 * 60 * 1000);
+        const end = new Date(start.getTime() + 60 * 60 * 1000); // 1 hora
 
         const res = await calendar.events.list({
             calendarId: process.env.GOOGLE_CALENDAR_ID,
@@ -116,9 +127,38 @@ async function checkRealAvailability(isoDateStart) {
         return activeEvents.length > 0 ? { status: 'busy' } : { status: 'free' };
 
     } catch (error) {
-        console.error("❌ ERROR GOOGLE:", error);
-        // Devolvemos el mensaje crudo para que lo veas en WhatsApp
-        return { status: 'error', rawError: error.message }; 
+        return { status: 'error', message: error.message };
+    }
+}
+
+// --- NUEVA FUNCIÓN: CREAR EVENTO ---
+async function crearEventoCalendario(isoDateStart, clientPhone) {
+    try {
+        await jwtClient.authorize();
+        const calendar = google.calendar({ version: 'v3', auth: jwtClient });
+        
+        const start = new Date(isoDateStart);
+        const end = new Date(start.getTime() + 60 * 60 * 1000); // Duración: 1 hora
+
+        const event = {
+            summary: `Cita BarberBot - Cliente ${clientPhone}`,
+            description: `Agendado automáticamente por WhatsApp. Cliente: ${clientPhone}`,
+            start: { dateTime: start.toISOString() },
+            end: { dateTime: end.toISOString() },
+            colorId: '2' // Color verde en Google Calendar
+        };
+
+        const res = await calendar.events.insert({
+            calendarId: process.env.GOOGLE_CALENDAR_ID,
+            resource: event,
+        });
+
+        console.log("✅ Evento creado:", res.data.htmlLink);
+        return { status: 'success', link: res.data.htmlLink };
+
+    } catch (error) {
+        console.error("❌ Error creando evento:", error);
+        return { status: 'error', error: error.message };
     }
 }
 
@@ -134,4 +174,4 @@ async function sendToWhatsApp(to, textBody) {
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => { console.log(`🚀 BarberBot V4 Debug (${PORT})`); });
+app.listen(PORT, () => { console.log(`🚀 BarberBot V6 (Agendador) corriendo en puerto ${PORT}`); });
