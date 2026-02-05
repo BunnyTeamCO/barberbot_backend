@@ -33,7 +33,31 @@ const jwtClient = new google.auth.JWT(
   ['https://www.googleapis.com/auth/calendar']
 );
 
-// --- 2. RUTAS WEBHOOK ---
+// --- 2. AUTO-MIGRACIÓN (LA CURA) 💉 ---
+// Esta función se ejecuta al iniciar y repara la tabla automáticamente
+async function initDB() {
+  try {
+    console.log("🔧 Verificando salud de la base de datos...");
+    
+    // 1. Asegurar que la tabla clients tenga la columna conversation_state
+    await pool.query(`
+      ALTER TABLE clients 
+      ADD COLUMN IF NOT EXISTS conversation_state VARCHAR(50) DEFAULT 'WAITING_NAME';
+    `);
+    
+    // 2. Asegurar columna full_name
+    await pool.query(`
+      ALTER TABLE clients 
+      ADD COLUMN IF NOT EXISTS full_name VARCHAR(255);
+    `);
+
+    console.log("✅ Base de datos parchada y lista.");
+  } catch (e) {
+    console.error("⚠️ Error en auto-migración (No crítico si ya existe):", e.message);
+  }
+}
+
+// --- 3. RUTAS ---
 app.get('/webhook', (req, res) => {
   if (req.query['hub.verify_token'] === process.env.META_VERIFY_TOKEN) {
     res.status(200).send(req.query['hub.challenge']);
@@ -43,9 +67,7 @@ app.get('/webhook', (req, res) => {
 });
 
 app.post('/webhook', async (req, res) => {
-  // Siempre responder 200 a Meta primero
   res.sendStatus(200);
-
   const body = req.body;
   if (!body.object || !body.entry?.[0]?.changes?.[0]?.value?.messages?.[0]) return;
 
@@ -54,7 +76,6 @@ app.post('/webhook', async (req, res) => {
   const text = (message.text ? message.text.body : '').trim();
 
   try {
-    // COMANDO RESET
     if (text.toLowerCase() === '/reset') {
         await pool.query("DELETE FROM clients WHERE phone_number = $1", [from]);
         await sendToWhatsApp(from, "🔄 Memoria borrada. Escríbeme 'Hola' para empezar de nuevo.");
@@ -113,40 +134,22 @@ app.post('/webhook', async (req, res) => {
 
   } catch (error) {
     console.error("❌ ERROR CRÍTICO:", error.message);
-    // Intentar avisar al usuario si algo sale mal
-    try {
-        await sendToWhatsApp(from, "Lo siento, tuve un problema interno. 😵‍💫 ¿Puedes intentar escribirme de nuevo?");
-    } catch (e) {}
+    try { await sendToWhatsApp(from, "Lo siento, tuve un problema interno. 😵‍💫 ¿Puedes intentar escribirme de nuevo?"); } catch (e) {}
   }
 });
 
 // --- FUNCIONES IA ---
-
 async function talkToGemini(userInput, userName) {
     try {
         const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
         const now = new Date().toLocaleString("es-CO", { timeZone: "America/Bogota" });
-
         const prompt = `
             Eres el dueño de la barbería "Alpelo" en Colombia. 
-            Hablas con tu cliente: ${userName}.
-            Hora actual en Colombia: ${now}.
-            Mensaje del cliente: "${userInput}"
-
-            PERSONALIDAD:
-            - Habla como un barbero amable y profesional (parcero, qué nota, de una, un gusto).
-            - NO seas repetitivo. Si el usuario solo saluda, responde variado.
-            - Si el usuario dice cosas cortas como "si" o "ok", continúa la charla de forma natural preguntando si quiere agendar algo.
-
-            REGLA DE ORO: Responde siempre en JSON puro:
-            {
-                "intent": "booking" | "chat",
-                "date": "ISO_DATE" (si pide cita),
-                "humanDate": "Texto amigable",
-                "reply": "Respuesta al cliente"
-            }
+            Cliente: ${userName}. Hora actual: ${now}.
+            Mensaje: "${userInput}"
+            PERSONALIDAD: Amable, parcero, proactivo.
+            REGLA: Responde JSON: { "intent": "booking"|"chat", "date": "ISO_DATE", "humanDate": "Texto", "reply": "Respuesta" }
         `;
-
         const result = await model.generateContent(prompt);
         return JSON.parse(result.response.text().replace(/```json|```/g, '').trim());
     } catch (e) {
@@ -155,7 +158,6 @@ async function talkToGemini(userInput, userName) {
 }
 
 // --- FUNCIONES AUXILIARES ---
-
 async function checkCalendar(isoDate) {
     try {
         await jwtClient.authorize();
@@ -179,7 +181,6 @@ async function saveBooking(isoDate, phone, userId, name) {
         const calendar = google.calendar({ version: 'v3', auth: jwtClient });
         const start = new Date(isoDate);
         const end = new Date(start.getTime() + 60 * 60 * 1000);
-
         const gRes = await calendar.events.insert({
             calendarId: process.env.GOOGLE_CALENDAR_ID,
             resource: {
@@ -190,7 +191,6 @@ async function saveBooking(isoDate, phone, userId, name) {
                 colorId: '2'
             }
         });
-
         await pool.query(
             "INSERT INTO appointments (id, client_id, start_time, end_time, google_event_id) VALUES ($1, $2, $3, $4, $5)",
             [crypto.randomUUID(), userId, start.toISOString(), end.toISOString(), gRes.data.id]
@@ -207,5 +207,9 @@ async function sendToWhatsApp(to, text) {
     } catch (e) { console.error("Error WhatsApp:", e.message); }
 }
 
+// --- INICIO CON REPARACIÓN ---
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 BarberBot V19 Online`));
+// Primero reparamos la BD, luego arrancamos el servidor
+initDB().then(() => {
+    app.listen(PORT, () => console.log(`🚀 BarberBot V20 (Auto-Fix) Online`));
+});
