@@ -52,15 +52,15 @@ app.post('/webhook', async (req, res) => {
   const text = (message.text ? message.text.body : '').trim();
 
   try {
-    // RESET
+    // COMANDO RESET
     if (text.toLowerCase() === '/reset') {
         await pool.query("DELETE FROM clients WHERE phone_number = $1", [from]);
-        await sendToWhatsApp(from, "🔄 Memoria borrada. Empecemos de cero.");
+        await sendToWhatsApp(from, "🔄 Reset completo. Escríbeme 'Hola'.");
         return;
     }
 
     // A. IDENTIFICAR USUARIO
-    let userRes = await pool.query('SELECT id, full_name, conversation_state FROM clients WHERE phone_number = $1', [from]);
+    let userRes = await pool.query('SELECT id, full_name, email, conversation_state FROM clients WHERE phone_number = $1', [from]);
     
     // B. BIENVENIDA (Usuario Nuevo)
     if (userRes.rows.length === 0) {
@@ -72,20 +72,19 @@ app.post('/webhook', async (req, res) => {
 
     const user = userRes.rows[0];
 
-    // C. GUARDAR NOMBRE (Y saltar directo a activo, SIN pedir email)
+    // C. GUARDAR NOMBRE (Y saltar directo a activo)
     if (user.conversation_state === 'WAITING_NAME') {
         const cleanName = text.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
         if (cleanName.length < 3) {
             await sendToWhatsApp(from, "Dame un nombre real, porfa. 😉");
             return;
         }
-        // Activamos de inmediato
         await pool.query("UPDATE clients SET full_name = $1, conversation_state = 'ACTIVE' WHERE phone_number = $2", [cleanName, from]);
-        await sendToWhatsApp(from, `¡Un gusto, *${cleanName}*! 🤝 Ya estás registrado.\n\nCuéntame, **¿qué día quieres venir a motilarte?**`);
+        await sendToWhatsApp(from, `¡Un gusto, *${cleanName}*! 🤝 Ya te registré.\n\nCuéntame, **¿qué día y a qué hora quieres venir a motilarte?**`);
         return;
     }
 
-    // D. CHAT ACTIVO
+    // D. CHAT ACTIVO CON IA
     const clientName = user.full_name || "Amigo";
     
     await saveChatMessage(user.id, 'user', text);
@@ -94,29 +93,31 @@ app.post('/webhook', async (req, res) => {
     
     console.log(`🧠 IA (${ai.intent}):`, ai.reply);
 
-    let response = ai.reply;
+    let messageToSend = ai.reply; // Por defecto usamos lo que diga la IA
 
-    // --- ACCIONES ---
+    // --- LÓGICA DE AGENDAMIENTO ---
 
     if (ai.intent === 'booking' && ai.date) {
+        // 1. Verificar disponibilidad en CALENDARIO DEL BARBERO
         const check = await checkCalendar(ai.date);
         
         if (check.status === 'busy') {
-            response = `Uff ${clientName}, a las *${ai.humanDate}* ya estoy ocupado. 😅 ¿Te sirve otra hora?`;
+            // Si está ocupado, sobrescribimos la respuesta de la IA
+            messageToSend = `Uff ${clientName}, revisé mi agenda y a las *${ai.humanDate}* ya tengo un cliente. 😅\n\n¿Te sirve una hora antes o después?`;
         } else if (check.status === 'free') {
-            // 1. AGENDAR EN TU CALENDARIO (Sin invitar)
-            const result = await saveBooking(ai.date, from, user.id, clientName);
+            // 2. Si está libre -> AGENDAR EN CALENDARIO DEL BARBERO
+            const result = await saveBookingInBarberCalendar(ai.date, from, user.id, clientName);
             
             if (result.success) {
-                // 2. GENERAR LINK MÁGICO PARA EL CLIENTE
+                // 3. GENERAR MAGIC LINK PARA EL CLIENTE
                 const link = generateGoogleCalendarLink(ai.date, "Cita en Alpelo", "Corte de cabello y barba");
                 
-                response = `✅ ¡Listo el pollo! Agendado para el *${ai.humanDate}*.\n\n📅 *Agrégalo a tu calendario aquí:*\n${link}`;
+                messageToSend = `✅ ¡Listo el pollo! Te agendé en mi sistema para el *${ai.humanDate}*.\n\n📅 *Toca este link para guardarlo en TU calendario:*\n${link}`;
             } else {
-                response = `❌ Error técnico: ${result.error}`;
+                messageToSend = `❌ Tuve un error técnico guardando la cita en mi sistema. Intenta de nuevo porfa.`;
             }
         } else {
-            response = `Error verificando agenda: ${check.message}`;
+            messageToSend = `Error verificando mi agenda: ${check.message}`;
         }
     }
     
@@ -130,29 +131,21 @@ app.post('/webhook', async (req, res) => {
                 const hora = dateObj.toLocaleTimeString('es-CO', { timeZone: 'America/Bogota', hour: '2-digit', minute:'2-digit' });
                 return `🗓️ *${fecha}* a las *${hora}*`;
             }).join("\n");
-            response = `Aquí están tus citas, ${clientName}:\n\n${lista}`;
+            messageToSend = `Aquí están tus citas, ${clientName}:\n\n${lista}`;
         } else {
-            response = `No tienes citas futuras. ¿Agendamos?`;
+            messageToSend = `No tienes citas futuras programadas. ¿Agendamos?`;
         }
     }
 
-    // CANCELAR Y REAGENDAR
+    // CANCELAR
     else if (ai.intent === 'cancel') {
         const result = await cancelNextAppointment(user.id);
-        response = result.success ? `🗑️ Listo, cita cancelada.` : `No encontré citas para cancelar.`;
-    }
-    else if (ai.intent === 'reschedule' && ai.date) {
-        const check = await checkCalendar(ai.date);
-        if (check.status === 'busy') {
-            response = `Ocupado a esa hora (${ai.humanDate}). Busca otra.`;
-        } else {
-            const result = await rescheduleNextAppointment(user.id, ai.date);
-            response = result.success ? `🔄 Cita movida para el *${ai.humanDate}*.` : `No encontré cita para mover.`;
-        }
+        messageToSend = result.success ? `🗑️ Listo, cita cancelada y borrada de mi agenda.` : `No encontré citas pendientes para cancelar.`;
     }
 
-    await sendToWhatsApp(from, response);
-    await saveChatMessage(user.id, 'assistant', response);
+    // ENVIAR RESPUESTA FINAL (Una sola vez)
+    await sendToWhatsApp(from, messageToSend);
+    await saveChatMessage(user.id, 'assistant', messageToSend);
 
   } catch (error) {
     console.error("❌ ERROR CRÍTICO:", error.message);
@@ -161,48 +154,60 @@ app.post('/webhook', async (req, res) => {
 
 // --- 3. FUNCIONES DE CALENDARIO ---
 
-// FUNCIÓN NUEVA: Generar Link Público
+// Genera el link para que el usuario agregue el evento a SU propio calendario
 function generateGoogleCalendarLink(isoDate, title, details) {
     const start = new Date(isoDate);
-    const end = new Date(start.getTime() + 60 * 60 * 1000); // 1 hora
+    const end = new Date(start.getTime() + 60 * 60 * 1000); // 1 hora de duración
 
-    // Formato requerido por Google: YYYYMMDDTHHmmssZ (En UTC)
+    // Formato YYYYMMDDTHHmmssZ (UTC)
     const format = (d) => d.toISOString().replace(/-|:|\.\d\d\d/g, "");
     
-    return `https://www.google.com/calendar/render?action=TEMPLATE&text=${encodeURIComponent(title)}&dates=${format(start)}/${format(end)}&details=${encodeURIComponent(details)}`;
+    return `https://www.google.com/calendar/render?action=TEMPLATE&text=${encodeURIComponent(title)}&dates=${format(start)}/${format(end)}&details=${encodeURIComponent(details)}&sf=true&output=xml`;
 }
 
 async function checkCalendar(isoDate) {
     try {
         await jwtClient.authorize();
         const calendar = google.calendar({ version: 'v3', auth: jwtClient });
+        
         const start = new Date(isoDate);
-        const end = new Date(start.getTime() + 60 * 60 * 1000); 
+        const end = new Date(start.getTime() + 60 * 60 * 1000); // 1 hora
+
+        console.log(`📅 Verificando disponibilidad Barbero: ${start.toLocaleString()}`);
+
         const res = await calendar.events.list({
-            calendarId: process.env.GOOGLE_CALENDAR_ID,
+            calendarId: process.env.GOOGLE_CALENDAR_ID, // El calendario del BARBERO
             timeMin: start.toISOString(),
             timeMax: end.toISOString(),
             singleEvents: true
         });
-        const active = res.data.items.filter(e => e.status !== 'cancelled' && e.transparency !== 'transparent');
-        return active.length > 0 ? { status: 'busy' } : { status: 'free' };
+
+        // Si hay CUALQUIER evento que no esté cancelado, está ocupado.
+        const conflicts = res.data.items.filter(e => e.status !== 'cancelled' && e.transparency !== 'transparent');
+        
+        if (conflicts.length > 0) {
+            console.log(`⚠️ Ocupado por: ${conflicts[0].summary}`);
+            return { status: 'busy' };
+        }
+        return { status: 'free' };
+
     } catch (e) { return { status: 'error', message: e.message }; }
 }
 
-async function saveBooking(isoDate, phone, userId, name) {
+async function saveBookingInBarberCalendar(isoDate, phone, userId, name) {
     try {
         await jwtClient.authorize();
         const calendar = google.calendar({ version: 'v3', auth: jwtClient });
         const start = new Date(isoDate);
         const end = new Date(start.getTime() + 60 * 60 * 1000);
 
+        // Crear evento en el calendario del BARBERO
         const event = {
             summary: `Cita: ${name}`,
-            description: `Cliente: ${name}\nWhatsApp: ${phone}`,
+            description: `Cliente: ${name}\nWhatsApp: ${phone}\nAgendado por BarberBot`,
             start: { dateTime: start.toISOString() },
             end: { dateTime: end.toISOString() },
-            colorId: '2',
-            // YA NO USAMOS ATTENDEES NI REMINDERS AQUÍ PARA EVITAR EL ERROR
+            colorId: '2', // Color verde
         };
 
         const gRes = await calendar.events.insert({
@@ -210,28 +215,35 @@ async function saveBooking(isoDate, phone, userId, name) {
             resource: event,
         });
         
+        // Guardar referencia en BD
         await pool.query("INSERT INTO appointments (id, client_id, start_time, end_time, google_event_id) VALUES ($1, $2, $3, $4, $5)", [crypto.randomUUID(), userId, start.toISOString(), end.toISOString(), gRes.data.id]);
         return { success: true };
     } catch (e) { 
+        console.error("Error guardando en calendario barbero:", e);
         return { success: false, error: e.message }; 
     }
 }
 
-// --- 4. CEREBRO IA ---
+// --- 4. CEREBRO IA (Prompt Ajustado) ---
 async function talkToGemini(userInput, userName, history) {
     try {
         const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
         const now = new Date().toLocaleString("es-CO", { timeZone: "America/Bogota" });
         const prompt = `
             Eres "Alpelo" (Colombia). Cliente: ${userName}. Hora: ${now}.
-            HISTORIAL: ${history}
-            CLIENTE: "${userInput}"
-            INTENCIONES: "booking", "check", "cancel", "reschedule", "chat".
-            JSON: { "intent": "...", "date": "ISO_DATE-05:00", "humanDate": "Texto", "reply": "Texto" }
+            HISTORIAL RECIENTE: ${history}
+            CLIENTE DICE: "${userInput}"
+            
+            INSTRUCCIONES:
+            - Si el cliente saluda, responde CORTO y ve al grano: "¿Qué día te agendo?".
+            - Si pide cita, extrae fecha ISO (-05:00).
+            - NO repitas "cuéntame" si ya lo dijiste.
+
+            JSON: { "intent": "booking"|"check"|"cancel"|"reschedule"|"chat", "date": "ISO_DATE-05:00", "humanDate": "Texto", "reply": "Texto" }
         `;
         const result = await model.generateContent(prompt);
         return JSON.parse(result.response.text().replace(/```json|```/g, '').trim());
-    } catch (e) { return { intent: "chat", reply: "Cuéntame." }; }
+    } catch (e) { return { intent: "chat", reply: "¿En qué te ayudo?" }; }
 }
 
 // --- 5. EXTRAS ---
@@ -243,4 +255,4 @@ async function getChatHistory(clientId) { try { const res = await pool.query("SE
 async function sendToWhatsApp(to, text) { try { await axios.post(`https://graph.facebook.com/v18.0/${process.env.META_PHONE_ID}/messages`, { messaging_product: 'whatsapp', to, text: { body: text } }, { headers: { 'Authorization': `Bearer ${process.env.META_TOKEN}` } }); } catch (e) {} }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 BarberBot V31 (Link Mágico) Online`));
+app.listen(PORT, () => console.log(`🚀 BarberBot V32 (Flow Perfect) Online`));
